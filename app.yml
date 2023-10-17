@@ -96,6 +96,7 @@ services:
       - VALIDATOR_REGISTRY_FILE_SOURCE_PATH=${VALIDATOR_REGISTRY_FILE_SOURCE_PATH}
       - EL_RPC_URLS=${EL_RPC_URLS}
       - CL_API_URLS=${CL_API_URLS}
+      - WORKING_MODE=${WORKING_MODE}
     ports:
       - "${HTTP_PORT}:${HTTP_PORT}"
     volumes:
