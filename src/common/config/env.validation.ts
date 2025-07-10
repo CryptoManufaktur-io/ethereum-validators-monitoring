@@ -8,6 +8,7 @@ import {
   IsNotEmpty,
   IsNumber,
   IsObject,
+  IsOptional,
   IsPort,
   IsString,
   Max,
@@ -21,8 +22,8 @@ import { Environment, LogFormat, LogLevel } from './interfaces';
 
 export enum Network {
   Mainnet = 1,
-  Görli = 5,
-  Kintsugi = 1337702,
+  Goerli = 5,
+  Holesky = 17000,
 }
 
 export enum ValidatorRegistrySource {
@@ -125,7 +126,6 @@ export class EnvironmentVariables {
   @Min(1)
   @Max(5000000)
   @Transform(({ value }) => parseInt(value, 10), { toClassOnly: true })
-  @ValidateIf((vars) => vars.VALIDATOR_REGISTRY_SOURCE == ValidatorRegistrySource.Lido && vars.NODE_ENV != Environment.test)
   public ETH_NETWORK!: Network;
 
   @IsArray()
@@ -157,9 +157,15 @@ export class EnvironmentVariables {
   @Transform(({ value }) => parseInt(value, 10), { toClassOnly: true })
   public CL_API_GET_BLOCK_INFO_MAX_RETRIES = 1;
 
+  @IsInt()
+  @Min(1)
+  @Transform(({ value }) => parseInt(value, 10), { toClassOnly: true })
+  public CL_API_MAX_SLOT_DEEP_COUNT = 32;
+
   @IsNumber()
   @Min(74240) // Altair
   @Transform(({ value }) => parseInt(value, 10), { toClassOnly: true })
+  @ValidateIf((vars) => vars.ETH_NETWORK === Network.Mainnet)
   public START_EPOCH = 155000;
 
   @IsNumber()
@@ -255,12 +261,45 @@ export class EnvironmentVariables {
   @Transform(({ value }) => parseInt(value, 10), { toClassOnly: true })
   public BAD_ATTESTATION_EPOCHS = 3;
 
+  @IsOptional()
+  @IsString()
+  @Transform(({ value }) => value.replace(/\/$/, ''))
+  public CL_EXPLORER_URL!: string;
+
+  @IsOptional()
+  @IsString()
+  @Transform(({ value }) => {
+    if (!value.startsWith('/')) {
+      value = `/${value}`;
+    }
+    if (!value.endsWith('/')) {
+      value = `${value}/`;
+    }
+    return value;
+  })
+  public CL_EXPLORER_VALIDATORS_URL_SUFFIX!: string;
+
+  @IsNumber()
+  @Min(1)
+  @Max(20)
+  @Transform(({ value }) => parseInt(value, 10), { toClassOnly: true })
+  public VAL_COUNT_IN_ALERT_BODY = 10;
+
   /**
    * Critical alerts will be sent for NOs with validators count greater this value
    */
   @IsNumber()
+  @Min(1)
   @Transform(({ value }) => parseInt(value, 10), { toClassOnly: true })
   public CRITICAL_ALERTS_MIN_VAL_COUNT = 100;
+
+  @IsObject()
+  @Transform(({ value }) => JSON.parse(value), { toClassOnly: true })
+  public CRITICAL_ALERTS_MIN_ACTIVE_VAL_COUNT = {};
+
+  @IsObject()
+  @Transform(({ value }) => JSON.parse(value), { toClassOnly: true })
+  public CRITICAL_ALERTS_MIN_AFFECTED_VAL_COUNT = {};
 
   @IsString()
   public CRITICAL_ALERTS_ALERTMANAGER_URL = '';
