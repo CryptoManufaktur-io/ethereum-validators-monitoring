@@ -11,23 +11,37 @@ import { ConfigService } from 'common/config';
 import { AttestationCommitteeInfo, ConsensusProviderService } from 'common/consensus-provider';
 import { Epoch, Slot } from 'common/consensus-provider/types';
 import { allSettled } from 'common/functions/allSettled';
+import { makeDefaultMap } from 'common/functions/makeDefaultMap';
 import { range } from 'common/functions/range';
 import { unblock } from 'common/functions/unblock';
 import { PrometheusService, TrackTask } from 'common/prometheus';
 import { SummaryService } from 'duty/summary';
 
-import { getFlags } from './attestation.constants';
+import { getAttestationFlags } from './attestation.constants';
 
 interface SlotAttestation {
-  included_in_block: number;
-  bits: BitArray;
+  includedInBlock: number;
+  aggregationBits: BitArray;
+  committeeIndexes: number[] | null;
   head: string;
-  target_root: string;
-  target_epoch: number;
-  source_root: string;
-  source_epoch: number;
+  targetRoot: string;
+  targetEpoch: Epoch;
+  sourceRoot: string;
+  sourceEpoch: Epoch;
   slot: number;
-  committee_index: number;
+  committeeIndex: number;
+}
+
+interface AttestationValidators {
+  source: number[];
+  target: number[];
+  head: number[];
+}
+
+interface AttestationFlags {
+  source: boolean;
+  target: boolean;
+  head: boolean;
 }
 
 @Injectable()
@@ -35,6 +49,7 @@ export class AttestationService {
   private processedEpoch: number;
   private readonly slotsInEpoch: number;
   private readonly savedCanonSlotsAttProperties: Map<number, string>;
+
   public constructor(
     @Inject(LOGGER_PROVIDER) protected readonly logger: LoggerService,
     protected readonly config: ConfigService,
@@ -50,17 +65,20 @@ export class AttestationService {
   public async check(epoch: Epoch, stateSlot: Slot): Promise<void> {
     this.processedEpoch = epoch;
     this.savedCanonSlotsAttProperties.clear();
-    const { attestations } = await this.getProcessedAttestations();
-    this.logger.log(`Getting attestation duties info`);
-    const committees = await this.getAttestationCommittees(stateSlot);
+    this.logger.log(`Getting attestations and duties info`);
+    const [attestations, committees] = await allSettled([this.getProcessedAttestations(), this.getAttestationCommittees(stateSlot)]);
     this.logger.log(`Processing attestation duty info`);
+
+    const firstSlotInPreviousEpoch = (epoch - 1) * this.slotsInEpoch;
     const maxBatchSize = 5;
     let index = 0;
     for (const attestation of attestations) {
-      // Each attestation corresponds to committee. Committee may have several aggregate attestations
-      const committee = committees.get(`${attestation.committee_index}_${attestation.slot}`);
-      if (!committee) continue;
-      await this.processAttestation(epoch, attestation, committee);
+      // These attestations have been processed in previous cycles
+      if (attestation.slot <= firstSlotInPreviousEpoch - 1) {
+        continue;
+      }
+
+      await this.processAttestation(epoch, attestation, committees);
       // Long loop (2048 committees will be checked by ~7k attestations).
       // We need to unblock event loop immediately after each iteration
       // It makes this cycle slower but safer (but since it is executed async, impact will be minimal)
@@ -72,51 +90,58 @@ export class AttestationService {
     }
   }
 
-  protected async processAttestation(epoch: Epoch, attestation: SlotAttestation, committee: number[]) {
-    const attestationFlags = { source: [], target: [], head: [] };
+  protected async processAttestation(epoch: Epoch, attestation: SlotAttestation, committees: Map<string, number[]>) {
+    const attestationValidators: AttestationValidators = { source: [], target: [], head: [] };
     const [canonHead, canonTarget, canonSource] = await allSettled([
       this.getCanonSlotRoot(attestation.slot),
-      this.getCanonSlotRoot(attestation.target_epoch * this.slotsInEpoch),
-      this.getCanonSlotRoot(attestation.source_epoch * this.slotsInEpoch),
+      this.getCanonSlotRoot(attestation.targetEpoch * this.slotsInEpoch),
+      this.getCanonSlotRoot(attestation.sourceEpoch * this.slotsInEpoch),
     ]);
-    const att_valid_head = attestation.head == canonHead;
-    const att_valid_target = attestation.target_root == canonTarget;
-    const att_valid_source = attestation.source_root == canonSource;
-    const att_inc_delay = Number(attestation.included_in_block - attestation.slot);
-    const flags = getFlags(att_inc_delay, att_valid_source, att_valid_target, att_valid_head);
-    for (const [valCommIndex, validatorIndex] of committee.entries()) {
-      const att_happened = attestation.bits.get(valCommIndex);
-      if (!att_happened) continue;
-      const processed = this.summary.epoch(attestation.target_epoch).get(validatorIndex);
-      if (!processed?.att_valid_source && flags.source) {
-        attestationFlags.source.push(validatorIndex);
+
+    const forkEpochs = await this.clClient.getForkEpochs();
+    const attestationEpoch = Math.floor(attestation.includedInBlock / this.slotsInEpoch);
+    const isDenebFork = attestationEpoch >= forkEpochs.deneb;
+    const isElectraFork = attestationEpoch >= forkEpochs.electra;
+
+    const attValidHead = attestation.head === canonHead;
+    const attValidTarget = attestation.targetRoot === canonTarget;
+    const attValidSource = attestation.sourceRoot === canonSource;
+    const attIncDelay = Number(attestation.includedInBlock - attestation.slot);
+    const flags = getAttestationFlags(attIncDelay, attValidSource, attValidTarget, attValidHead, isDenebFork);
+
+    if (isElectraFork) {
+      let committeeOffset = 0;
+      for (const committeeIndex of attestation.committeeIndexes) {
+        const committee = committees.get(`${committeeIndex}_${attestation.slot}`);
+        this.processAttestationCommittee(
+          attestation,
+          committee,
+          committeeIndex,
+          committeeOffset,
+          attIncDelay,
+          flags,
+          attestationValidators,
+        );
+        committeeOffset += committee.length;
       }
-      if (!processed?.att_valid_target && flags.target) {
-        attestationFlags.target.push(validatorIndex);
-      }
-      if (!processed?.att_valid_head && flags.head) {
-        attestationFlags.head.push(validatorIndex);
-      }
-      this.summary.epoch(attestation.target_epoch).set({
-        val_id: validatorIndex,
-        epoch: attestation.target_epoch,
-        att_happened,
-        att_inc_delay: processed?.att_inc_delay || att_inc_delay,
-        att_valid_source: processed?.att_valid_source || flags.source,
-        att_valid_target: processed?.att_valid_target || flags.target,
-        att_valid_head: processed?.att_valid_head || flags.head,
-      });
+    } else {
+      // Each attestation corresponds to committee. Committee may have several aggregate attestations
+      const committee = committees.get(`${attestation.committeeIndex}_${attestation.slot}`);
+      this.processAttestationCommittee(attestation, committee, attestation.committeeIndex, 0, attIncDelay, flags, attestationValidators);
     }
+
     const blocksAttestations = this.summary.epoch(epoch).getMeta().attestation.blocks_attestations;
-    const blockMeta = blocksAttestations.get(attestation.included_in_block);
-    blockMeta.push(attestationFlags);
-    blocksAttestations.set(attestation.included_in_block, blockMeta);
+    const blockMeta = blocksAttestations.get(attestation.includedInBlock);
+    blockMeta.push(attestationValidators);
+    blocksAttestations.set(attestation.includedInBlock, blockMeta);
     this.summary.epoch(epoch).setMeta({ attestation: { blocks_attestations: blocksAttestations } });
   }
 
   protected async getCanonSlotRoot(slot: Slot) {
     const cached = this.savedCanonSlotsAttProperties.get(slot);
-    if (cached) return cached;
+    if (cached) {
+      return cached;
+    }
     const root = (await this.clClient.getBeaconBlockHeaderOrPreviousIfMissed(slot)).root;
     this.savedCanonSlotsAttProperties.set(slot, root);
     return root;
@@ -125,7 +150,20 @@ export class AttestationService {
   @TrackTask('process-chain-attestations')
   protected async getProcessedAttestations() {
     this.logger.log(`Processing attestations from blocks info`);
-    const bitsMap = new Map<string, BitArray>();
+    const forkEpochs = await this.clClient.getForkEpochs();
+
+    const aggregationBitsMap = makeDefaultMap<string, BitArray>((key: string) => {
+      const bytesArray = fromHexString(key);
+      const aggregationBitsVector = new BitVectorType(bytesArray.length * 8);
+      return aggregationBitsVector.deserialize(bytesArray);
+    });
+    const committeeIndexesMap = makeDefaultMap<string, number[]>((key: string) => {
+      const bytesArray = fromHexString(key);
+      const committeeBitsVector = new BitVectorType(bytesArray.length * 8);
+      const committeeBitsArray = committeeBitsVector.deserialize(bytesArray);
+      return committeeBitsArray.getTrueBitIndexes();
+    });
+
     const attestations: SlotAttestation[] = [];
     const allMissedSlots: number[] = [];
     // Check all slots from previous epoch start to current epoch last slot
@@ -138,28 +176,27 @@ export class AttestationService {
         continue;
       }
       for (const att of block.message.body.attestations) {
-        let bits = bitsMap.get(att.aggregation_bits);
-        if (!bits) {
-          const bytesArray = fromHexString(att.aggregation_bits);
-          const CommitteeBits = new BitVectorType(bytesArray.length * 8);
-          bits = CommitteeBits.deserialize(bytesArray);
-          bitsMap.set(att.aggregation_bits, bits);
-        }
+        const aggregationBits = aggregationBitsMap.getOrCreate(att.aggregation_bits);
+        const includedInBlock = Number(block.message.slot);
+        const isElectraFork = Math.floor(includedInBlock / this.slotsInEpoch) >= forkEpochs.electra;
+        const committeeIndexes = isElectraFork ? committeeIndexesMap.getOrCreate(att.committee_bits) : null;
+
         attestations.push({
-          included_in_block: Number(block.message.slot),
-          bits: bits,
+          includedInBlock: includedInBlock,
+          aggregationBits,
+          committeeIndexes: committeeIndexes,
           head: att.data.beacon_block_root,
-          target_root: att.data.target.root,
-          target_epoch: Number(att.data.target.epoch),
-          source_root: att.data.source.root,
-          source_epoch: Number(att.data.source.epoch),
+          targetRoot: att.data.target.root,
+          targetEpoch: Number(att.data.target.epoch),
+          sourceRoot: att.data.source.root,
+          sourceEpoch: Number(att.data.source.epoch),
           slot: Number(att.data.slot),
-          committee_index: Number(att.data.index),
+          committeeIndex: Number(att.data.index),
         });
       }
     }
     this.logger.debug(`All missed slots in getting attestations info process: ${allMissedSlots}`);
-    return { attestations, allMissedSlots };
+    return attestations;
   }
 
   @TrackTask('get-attestation-committees')
@@ -212,5 +249,48 @@ export class AttestationService {
     await allSettled([pipelineFinish(prevPipeline), pipelineFinish(currPipeline)]);
 
     return committees;
+  }
+
+  private processAttestationCommittee(
+    attestation: SlotAttestation,
+    committee: number[],
+    committeeIndex: number,
+    committeeOffset: number,
+    attIncDelay: number,
+    attestationFlags: AttestationFlags,
+    attestationValidators: AttestationValidators,
+  ) {
+    if (committee == null) {
+      throw Error(`Committee ${committeeIndex} for attestation in slot ${attestation.slot} does not exist`);
+    }
+
+    for (const [valCommIndex, validatorIndex] of committee.entries()) {
+      const attHappened = attestation.aggregationBits.get(committeeOffset + valCommIndex);
+      if (!attHappened) {
+        continue;
+      }
+
+      const processed = this.summary.epoch(attestation.targetEpoch).get(validatorIndex);
+
+      if (!processed?.att_valid_source && attestationFlags.source) {
+        attestationValidators.source.push(validatorIndex);
+      }
+      if (!processed?.att_valid_target && attestationFlags.target) {
+        attestationValidators.target.push(validatorIndex);
+      }
+      if (!processed?.att_valid_head && attestationFlags.head) {
+        attestationValidators.head.push(validatorIndex);
+      }
+
+      this.summary.epoch(attestation.targetEpoch).set({
+        val_id: validatorIndex,
+        epoch: attestation.targetEpoch,
+        att_happened: true,
+        att_inc_delay: processed?.att_inc_delay || attIncDelay,
+        att_valid_source: processed?.att_valid_source || attestationFlags.source,
+        att_valid_target: processed?.att_valid_target || attestationFlags.target,
+        att_valid_head: processed?.att_valid_head || attestationFlags.head,
+      });
+    }
   }
 }
